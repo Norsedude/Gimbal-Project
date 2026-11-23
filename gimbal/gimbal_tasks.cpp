@@ -126,7 +126,7 @@ float angular_rate(lab4::gyroscope::read_t const& p_angular_velocity,
 
 void sensor_task(void* p_parameters)
 {
-  auto& context = *static_cast<task_context*>(p_parameters);
+  auto const& context = *static_cast<task_context const*>(p_parameters);
   auto const& parameters = context.parameters;
 
   auto const nominal_period =
@@ -182,7 +182,7 @@ void sensor_task(void* p_parameters)
 
 void input_task(void* p_parameters)
 {
-  auto& context = *static_cast<task_context*>(p_parameters);
+  auto const& context = *static_cast<task_context const*>(p_parameters);
   auto const& parameters = context.parameters;
 
   auto const period_ticks = pdMS_TO_TICKS(static_cast<std::uint32_t>(
@@ -233,7 +233,7 @@ void input_task(void* p_parameters)
 
 void actuator_task(void* p_parameters)
 {
-  auto& context = *static_cast<task_context*>(p_parameters);
+  auto const& context = *static_cast<task_context const*>(p_parameters);
   auto const& parameters = context.parameters;
 
   tilt_measurement tilt{ 0.0F };
@@ -274,7 +274,7 @@ void actuator_task(void* p_parameters)
 
 void heartbeat_task(void* p_parameters)
 {
-  auto& context = *static_cast<task_context*>(p_parameters);
+  auto const& context = *static_cast<task_context const*>(p_parameters);
 
   auto const half_period = pdMS_TO_TICKS(500);
   bool illuminated = false;
