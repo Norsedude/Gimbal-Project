@@ -70,9 +70,11 @@ public:
 
 private:
   /// Upper bound on status-register polls for any one wait. One poll costs
-  /// well over 4 bus cycles, so this is at least ~5 ms at 32 MHz - more than
-  /// six times the longest legitimate transfer here (7 bytes at 100 kHz).
-  static constexpr std::uint32_t max_polls = 40000;
+  /// roughly 8-15 bus cycles, so this is about 2-4 ms at 32 MHz. The longest
+  /// legitimate single wait here is about 0.3 ms (a 2-byte write at 100 kHz),
+  /// so this leaves a wide margin while keeping a missing sensor from
+  /// monopolising the CPU: the caller is the highest-priority task.
+  static constexpr std::uint32_t max_polls = 8000;
 
   /// Half an SCL period at 100 kHz, used while bit-banging bus recovery.
   static constexpr std::uint32_t recovery_half_period_cycles =

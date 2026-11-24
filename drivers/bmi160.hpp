@@ -320,14 +320,17 @@ private:
   /// re-seated wire is picked up again almost immediately.
   static constexpr std::uint32_t failures_before_recovery = 20;
 
+  /// Reads skipped without touching the bus after a re-initialisation fails.
+  /// At two reads per 10 ms cycle this is about 250 ms between attempts.
+  static constexpr std::uint32_t reads_skipped_while_absent = 50;
+
   /**
    * @brief Track read health and re-initialise the sensor if it went away.
    *
    * A loose jumper or a supply dip can reset the BMI160 back into suspend
    * mode, after which it answers with stale or zero data forever. Re-running
    * the start-up sequence brings it back without a board reset. One attempt
-   * per trigger (not the five used at power-on) bounds the time spent here
-   * to roughly the 210 ms of datasheet start-up delays.
+   * per trigger (not the five used at power-on) bounds the time spent here.
    */
   void note_read(bool p_succeeded)
   {
@@ -341,6 +344,33 @@ private:
     m_consecutive_failures = 0;
     m_recoveries++;
     m_initialized = attempt_configure();
+    if (!m_initialized) {
+      m_reads_to_skip = reads_skipped_while_absent;
+    }
+  }
+
+  /**
+   * @brief Whether to skip the bus entirely because the sensor is absent.
+   *
+   * Every read of a missing sensor costs a bus timeout, and the caller is
+   * typically the highest-priority task, so hammering a disconnected bus
+   * would starve every other task - the heartbeat included. While absent,
+   * reads return immediately without bus traffic, and one re-initialisation
+   * is attempted each time the skip window runs out.
+   */
+  bool sensor_absent()
+  {
+    if (m_reads_to_skip == 0) {
+      return false;
+    }
+    if (--m_reads_to_skip == 0) {
+      m_recoveries++;
+      m_initialized = attempt_configure();
+      if (!m_initialized) {
+        m_reads_to_skip = reads_skipped_while_absent;
+      }
+    }
+    return !m_initialized;
   }
 
   // On a bus error the last good acceleration sample is returned rather than
@@ -348,6 +378,9 @@ private:
   // complementary filter.
   lab4::accelerometer::read_t read_acceleration()
   {
+    if (sensor_absent()) {
+      return m_last_acceleration;
+    }
     std::array<std::uint8_t, axis_data_bytes> raw{};
     bool const succeeded = read_registers(register_acceleration_data, raw);
     note_read(succeeded);
@@ -369,6 +402,9 @@ private:
   // lets the estimate settle on the last good accelerometer angle instead.
   lab4::gyroscope::read_t read_angular_velocity()
   {
+    if (sensor_absent()) {
+      return { 0.0F, 0.0F, 0.0F };
+    }
     std::array<std::uint8_t, axis_data_bytes> raw{};
     bool const succeeded = read_registers(register_angular_velocity_data, raw);
     note_read(succeeded);
@@ -428,6 +464,7 @@ private:
   bool m_initialized = false;
   std::uint32_t m_consecutive_failures = 0;
   std::uint32_t m_recoveries = 0;
+  std::uint32_t m_reads_to_skip = 0;
   lab4::accelerometer::read_t m_last_acceleration{ 0.0F, 0.0F, 1.0F };
   lab4::gyroscope::read_t m_last_angular_velocity{ 0.0F, 0.0F, 0.0F };
   acceleration_channel m_acceleration_channel{ *this };
