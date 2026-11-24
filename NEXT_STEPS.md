@@ -1,10 +1,23 @@
 # What To Do Next
 
-Firmware is written and builds clean. **Nothing has been tested on hardware yet.**
-This is the order to do that in. Each step isolates one thing, so when something
-misbehaves you know exactly what caused it.
-
 Demo is **Thursday, December 3**.
+
+> **Progress as of 2026-11-23 — electrical bring-up is complete.**
+>
+> Tests 1-6 below all **passed on hardware**: boot, IMU (accelerometer *and*
+> gyroscope), angle tracking, servo response, counter-rotation direction, and
+> joystick control. The servo scale was measured and calibrated along the way
+> (a 90 deg IMU rotation moved the arm only 45 deg, so the pulse range was
+> widened from 1000-2000 us to 600-2400 us).
+>
+> **What remains is mostly mechanical, plus the demo deliverables:**
+> Step 2 (assembly), then Tests 7-8 (standalone boot, reliability), then
+> Step 7 (logic analyzer capture) and Step 8 (slides).
+>
+> One thing to redo after assembly: the counter-rotation direction was
+> confirmed with the IMU held by hand. If mounting ends up rotating it 180 deg
+> relative to that, the sign flips - re-run Test 5 and set
+> `invert_servo = true` if needed.
 
 ---
 

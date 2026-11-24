@@ -9,6 +9,46 @@ Target device: **MSPM0G3507** (Cortex-M0+, 32 MHz) · SDK **MSPM0-SDK 2.11.0.07*
 
 ---
 
+## Status
+
+Bring-up completed on hardware **2026-11-23**. Demo is **Thursday, December 3**.
+
+### Verified on the LaunchPad
+
+| Subsystem | Evidence |
+|---|---|
+| Boot and scheduler | Banner on UART, all five tasks created, telemetry streaming |
+| I2C bus (I2C1, PB2/PB3) | BMI160 answers every transaction at 100 kHz |
+| BMI160 **accelerometer + gyroscope** | `BMI160 ready` prints only after chip ID reads `0xD1` **and** `PMU_STATUS` confirms both sensors in normal power mode |
+| Complementary filter | ±0.02 deg of noise at rest, no drift; tracks smoothly through ±90 deg |
+| Joystick -> ADC -> offset | Stick deflection shifts the held angle in real time |
+| Servo driver + PWM | `servo` tracks as the exact negation of `angle` across the full range, clamps safely at the limits |
+| Counter-rotation direction | Tilt the base right, the arm goes left |
+| Servo scale | Measured and calibrated - see "Servo calibration" below |
+| Task communication | Three length-1 queues; angle, offset and status all cross task boundaries through them |
+
+### Still to do
+
+- Final mechanical assembly: IMU and pan-tilt base rigidly on one handle
+- Re-confirm counter-rotation direction **after** mounting (orientation can flip
+  the sign; the fix is `invert_servo = true`)
+- Re-seat the servo horn at boot centre so travel is symmetric
+- Standalone boot with no debugger attached
+- Two-to-three minute reliability run
+- Logic analyzer capture of the I2C traffic
+- Slides
+
+### Known weakness
+
+The I2C wait loops have no timeout. If a wire to the IMU comes loose mid-run,
+the sensor task blocks and the angle estimate freezes at exactly `0.00` (the
+driver's hold-last-good-sample fallback), while the heartbeat keeps blinking -
+so it *looks* alive. This was hit once during bring-up and cleared on restart.
+Bounded timeouts plus a visible telemetry error and automatic bus recovery are
+the planned fix.
+
+---
+
 ## Parts
 
 | Part | Notes |
