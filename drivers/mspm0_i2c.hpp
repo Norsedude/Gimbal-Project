@@ -1,33 +1,32 @@
 #pragma once
 
 // MSPM0G3507 I2C controller driver, implementing the lab4::i2c interface
-// (hal/i2c.hpp). Carried over from lab 4, where it was verified against the
-// BMI160 on real hardware, with the bounded waits described below added for
-// the gimbal.
+// (hal/i2c.hpp). Register sequence carried over from lab 4, where it was
+// verified against the BMI160 on real hardware, with two additions for the
+// final project:
+//
+//   1. Every wait is bounded. A missing ACK, a loose wire, or a sensor that
+//      stalls the bus makes the transaction return false within a few
+//      milliseconds instead of hanging the calling task forever.
+//   2. After a failed transaction the controller is reset and the bus is
+//      un-stuck (nine SCL pulses, I2C spec UM10204 section 3.1.16), so the
+//      next transaction starts from a clean state.
 //
 // I2C1 on PB2 (SCL) / PB3 (SDA), which are BoosterPack header pins 9 and 10.
 // The MSPM0 pins are driven in HiZ mode to emulate open-drain, so the bus
 // relies on external pull-up resistors - the ones on the BMI160 breakout.
 //
-// Bounded waits
-// -------------
-// Every poll loop here is bounded by a deadline taken from a steady clock.
-// The lab 4 version spun forever, which is harmless on a bench where the
-// sensor always answers, but in the gimbal one loose jumper parked the sensor
-// task inside this file permanently. The heartbeat kept blinking from its own
-// task, so the board looked alive while the angle estimate sat frozen at its
-// last value. A bounded wait turns that into a failed transaction, which the
-// lab4::i2c contract already provides for, and the caller keeps running.
-//
-// A failed transaction also resets the I2C peripheral, so a re-seated jumper
-// starts working again without a power cycle.
+// Transaction shape: a write-then-read is two complete I2C transfers, each
+// with its own START and STOP:
+//   START | 0x68+W | register | STOP   START | 0x68+R | data... NACK | STOP
+// The BMI160 keeps its register pointer across the STOP, so this reads the
+// same data a repeated-start transfer would.
 
 #include <cstdint>
 
 #include <ti/driverlib/driverlib.h>
 
 #include "../hal/i2c.hpp"
-#include "../hal/timer.hpp"
 #include "../third_party/span/span.hpp"
 
 namespace mspm0 {
@@ -38,8 +37,10 @@ constexpr std::uint32_t i2c_bus_clock_hz = 32000000;
 // I2C1 on PB2 (SCL) / PB3 (SDA) - BoosterPack header pins 9/10.
 constexpr std::uint32_t i2c_scl_pincm = IOMUX_PINCM15;
 constexpr std::uint32_t i2c_scl_function = IOMUX_PINCM15_PF_I2C1_SCL;
+constexpr std::uint32_t i2c_scl_pin = DL_GPIO_PIN_2;
 constexpr std::uint32_t i2c_sda_pincm = IOMUX_PINCM16;
 constexpr std::uint32_t i2c_sda_function = IOMUX_PINCM16_PF_I2C1_SDA;
+constexpr std::uint32_t i2c_sda_pin = DL_GPIO_PIN_3;
 
 /**
  * @brief Blocking I2C controller built on I2C1.
@@ -48,96 +49,178 @@ constexpr std::uint32_t i2c_sda_function = IOMUX_PINCM16_PF_I2C1_SDA;
  * finishes, so calls block the calling task for the duration of the transfer.
  * At 100 kHz a 1-byte write followed by a 6-byte read takes roughly 0.8 ms,
  * which fits comfortably inside the gimbal sensor task 10 ms period.
- *
- * No transaction can block longer than the configured timeout, so a silent
- * sensor costs one control cycle rather than the whole run.
  */
 class i2c final : public lab4::i2c
 {
 public:
   /**
-   * @brief How long a single transfer may stall before it is declared failed.
-   *
-   * The longest legitimate transfer on this bus is a 1-byte write followed by
-   * a 6-byte read, about 0.8 ms at 100 kHz. 5 ms is roughly six times that,
-   * while still being short enough that even two timed-out transactions in
-   * one pass cost a single 10 ms control cycle instead of the run.
-   */
-  static constexpr std::uint32_t default_timeout_milliseconds = 5;
-
-  /**
-   * @param p_clock - steady clock used to bound how long a stalled transfer
-   * can block the caller. Must outlive this object.
    * @param p_settings - bus settings; defaults to 100 kHz, the rate verified
    * against the BMI160 breakout in lab 4.
-   * @param p_timeout_milliseconds - per-transfer stall budget.
    */
-  explicit i2c(lab2::steady_clock& p_clock,
-               settings const& p_settings = {},
-               std::uint32_t p_timeout_milliseconds =
-                 default_timeout_milliseconds)
-    : m_clock(&p_clock)
-    , m_timeout_ticks(timeout_to_ticks(p_clock, p_timeout_milliseconds))
+  explicit i2c(settings const& p_settings = {})
   {
     driver_configure(p_settings);
   }
 
-  /**
-   * @brief Transactions that failed or timed out since boot.
-   *
-   * Zero on a healthy bus. A climbing count means the sensor wiring is
-   * intermittent, which is worth seeing on the telemetry line because the
-   * device driver above deliberately hides a single dropped sample by
-   * reporting the last good one.
-   */
-  [[nodiscard]] std::uint32_t fault_count() const
+  /// Transactions that failed (NACK, bus error, or timeout) since power-up.
+  [[nodiscard]] std::uint32_t failure_count() const
   {
-    return m_fault_count;
-  }
-
-  /// Whether the most recent transaction completed successfully.
-  [[nodiscard]] bool healthy() const
-  {
-    return m_healthy;
+    return m_failures;
   }
 
 private:
-  /// Converts a millisecond budget into steady-clock ticks, never zero.
-  static std::uint64_t timeout_to_ticks(lab2::steady_clock& p_clock,
-                                        std::uint32_t p_milliseconds)
-  {
-    auto const ticks =
-      (static_cast<std::uint64_t>(p_clock.frequency()) * p_milliseconds) /
-      1000;
-    return (ticks == 0) ? 1 : ticks;
-  }
+  /// Upper bound on status-register polls for any one wait. One poll costs
+  /// roughly 8-15 bus cycles, so this is about 2-4 ms at 32 MHz. The longest
+  /// legitimate single wait here is about 0.3 ms (a 2-byte write at 100 kHz),
+  /// so this leaves a wide margin while keeping a missing sensor from
+  /// monopolising the CPU: the caller is the highest-priority task.
+  static constexpr std::uint32_t max_polls = 8000;
+
+  /// Half an SCL period at 100 kHz, used while bit-banging bus recovery.
+  static constexpr std::uint32_t recovery_half_period_cycles =
+    i2c_bus_clock_hz / 200000;
 
   bool driver_configure(settings const& p_settings) override
   {
     if (p_settings.clock_rate == 0) {
       return false;
     }
-
-    // Kept so a fault can re-apply the same bit rate during recovery.
     m_settings = p_settings;
 
-    configure_pins();
-    return configure_peripheral();
+    // Port B is only powered here, never reset: the servo PWM pin (PB15) and
+    // the heartbeat LED (PB27) live on the same port, and resetting it would
+    // undo their configuration whenever this driver re-initialises.
+    DL_GPIO_enablePower(GPIOB);
+    delay_cycles(16);
+
+    route_pins_to_controller();
+    configure_controller();
+    return true;
+  }
+
+  bool driver_transaction(std::uint8_t p_address,
+                          std::span<std::uint8_t const> p_data_out,
+                          std::span<std::uint8_t> p_data_in) override
+  {
+    bool ok = true;
+    if (!p_data_out.empty()) {
+      ok = write(p_address, p_data_out);
+    }
+    if (ok && !p_data_in.empty()) {
+      ok = read(p_address, p_data_in);
+    }
+
+    if (!ok) {
+      m_failures++;
+      recover();
+    }
+    return ok;
+  }
+
+  bool write(std::uint8_t p_address, std::span<std::uint8_t const> p_data)
+  {
+    if (!wait_idle()) {
+      return false;
+    }
+    DL_I2C_fillControllerTXFIFO(
+      I2C1, p_data.data(), static_cast<std::uint16_t>(p_data.size()));
+    DL_I2C_startControllerTransfer(I2C1,
+                                   p_address,
+                                   DL_I2C_CONTROLLER_DIRECTION_TX,
+                                   static_cast<std::uint16_t>(p_data.size()));
+    // errata I2C_ERR_13: let the transfer start before polling status
+    delay_cycles(30);
+    return wait_done();
+  }
+
+  bool read(std::uint8_t p_address, std::span<std::uint8_t> p_data)
+  {
+    if (!wait_idle()) {
+      return false;
+    }
+    DL_I2C_startControllerTransfer(I2C1,
+                                   p_address,
+                                   DL_I2C_CONTROLLER_DIRECTION_RX,
+                                   static_cast<std::uint16_t>(p_data.size()));
+    delay_cycles(30);
+
+    for (auto& byte : p_data) {
+      std::uint32_t polls = 0;
+      while (DL_I2C_isControllerRXFIFOEmpty(I2C1)) {
+        if ((DL_I2C_getControllerStatus(I2C1) &
+             DL_I2C_CONTROLLER_STATUS_ERROR) ||
+            ++polls >= max_polls) {
+          return false;
+        }
+      }
+      byte = DL_I2C_receiveControllerData(I2C1);
+    }
+
+    return wait_done();
+  }
+
+  bool wait_idle()
+  {
+    for (std::uint32_t polls = 0; polls < max_polls; polls++) {
+      if (DL_I2C_getControllerStatus(I2C1) & DL_I2C_CONTROLLER_STATUS_IDLE) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool wait_done()
+  {
+    for (std::uint32_t polls = 0; polls < max_polls; polls++) {
+      auto const status = DL_I2C_getControllerStatus(I2C1);
+      if (!(status & DL_I2C_CONTROLLER_STATUS_BUSY)) {
+        return !(status & DL_I2C_CONTROLLER_STATUS_ERROR);
+      }
+    }
+    return false;
   }
 
   /**
-   * @brief Route PB2/PB3 to I2C1 as open-drain.
+   * @brief Return the bus and the controller to a known-good state.
    *
-   * Separate from configure_peripheral() because this resets all of GPIO
-   * port B, which also carries the servo PWM output (PB15) and the heartbeat
-   * LED (PB27). It must run once at construction, before those drivers are
-   * built, and never again - recovery touches the I2C peripheral only.
+   * If the sensor was interrupted mid-byte (a wire bumped, or the sensor
+   * browned out) it may still be holding SDA low waiting for clocks. Nine
+   * SCL pulses let it finish that byte and release SDA; a STOP then returns
+   * the bus to idle. The I2C1 peripheral is then fully reset and
+   * re-configured so no stale FIFO contents or error flags survive.
    */
-  void configure_pins()
+  void recover()
   {
-    DL_GPIO_reset(GPIOB);
-    DL_GPIO_enablePower(GPIOB);
+    // Take the pins away from I2C1 as plain open-drain GPIO, released high.
+    DL_GPIO_initDigitalOutput(i2c_scl_pincm);
+    DL_GPIO_initDigitalOutput(i2c_sda_pincm);
+    DL_GPIO_enableHiZ(i2c_scl_pincm);
+    DL_GPIO_enableHiZ(i2c_sda_pincm);
+    DL_GPIO_setPins(GPIOB, i2c_scl_pin | i2c_sda_pin);
+    DL_GPIO_enableOutput(GPIOB, i2c_scl_pin | i2c_sda_pin);
+    delay_cycles(recovery_half_period_cycles);
 
+    for (int pulse = 0; pulse < 9; pulse++) {
+      DL_GPIO_clearPins(GPIOB, i2c_scl_pin);
+      delay_cycles(recovery_half_period_cycles);
+      DL_GPIO_setPins(GPIOB, i2c_scl_pin);
+      delay_cycles(recovery_half_period_cycles);
+    }
+
+    // STOP condition: SDA rises while SCL is high.
+    DL_GPIO_clearPins(GPIOB, i2c_sda_pin);
+    delay_cycles(recovery_half_period_cycles);
+    DL_GPIO_setPins(GPIOB, i2c_sda_pin);
+    delay_cycles(recovery_half_period_cycles);
+    DL_GPIO_disableOutput(GPIOB, i2c_scl_pin | i2c_sda_pin);
+
+    route_pins_to_controller();
+    configure_controller();
+  }
+
+  void route_pins_to_controller()
+  {
+    // Route PB2/PB3 to I2C1, open-drain (HiZ) as the I2C bus requires.
     DL_GPIO_initPeripheralInputFunctionFeatures(i2c_scl_pincm,
                                                 i2c_scl_function,
                                                 DL_GPIO_INVERSION_DISABLE,
@@ -150,17 +233,15 @@ private:
                                                 DL_GPIO_RESISTOR_NONE,
                                                 DL_GPIO_HYSTERESIS_DISABLE,
                                                 DL_GPIO_WAKEUP_DISABLE);
-
     DL_GPIO_enableHiZ(i2c_scl_pincm);  // emulate open drain
     DL_GPIO_enableHiZ(i2c_sda_pincm);  // emulate open drain
   }
 
-  /// Brings I2C1 itself up from reset. Safe to re-run at any time.
-  bool configure_peripheral()
+  void configure_controller()
   {
     DL_I2C_reset(I2C1);
     DL_I2C_enablePower(I2C1);
-    delay_cycles(10);
+    delay_cycles(16);
 
     // Run I2C1 off BUSCLK (32 MHz) undivided.
     DL_I2C_ClockConfig clock_config{ DL_I2C_CLOCK_BUSCLK,
@@ -179,156 +260,10 @@ private:
     DL_I2C_setControllerRXFIFOThreshold(I2C1, DL_I2C_RX_FIFO_LEVEL_BYTES_1);
     DL_I2C_enableControllerClockStretching(I2C1);
     DL_I2C_enableController(I2C1);
-
-    return true;
   }
 
-  bool driver_transaction(std::uint8_t p_address,
-                          std::span<std::uint8_t const> p_data_out,
-                          std::span<std::uint8_t> p_data_in) override
-  {
-    auto const succeeded =
-      attempt_transaction(p_address, p_data_out, p_data_in);
-
-    m_healthy = succeeded;
-    if (!succeeded) {
-      m_fault_count++;
-      recover_bus();
-    }
-
-    return succeeded;
-  }
-
-  bool attempt_transaction(std::uint8_t p_address,
-                           std::span<std::uint8_t const> p_data_out,
-                           std::span<std::uint8_t> p_data_in)
-  {
-    if (!p_data_out.empty() && !write(p_address, p_data_out)) {
-      return false;
-    }
-
-    if (!p_data_in.empty() && !read(p_address, p_data_in)) {
-      return false;
-    }
-
-    return true;
-  }
-
-  /**
-   * @brief Put the controller back into a known-good state after a fault.
-   *
-   * A timed-out transfer can leave the state machine part-way through a
-   * transaction and the FIFOs holding stale bytes. Clearing the transfer,
-   * flushing both FIFOs and re-initializing the peripheral means the next
-   * transaction starts clean, so re-seating a jumper is enough to resume
-   * without a power cycle.
-   *
-   * Only I2C1 is touched - not the GPIO port, which the servo and LED share.
-   *
-   * This does not rescue a bus wedged by the sensor itself holding SDA low,
-   * which needs nine manual clock pulses to shift out. That has not been seen
-   * on this hardware; a loose jumper shows up as failed transactions instead.
-   */
-  void recover_bus()
-  {
-    DL_I2C_resetControllerTransfer(I2C1);
-    DL_I2C_flushControllerTXFIFO(I2C1);
-    DL_I2C_flushControllerRXFIFO(I2C1);
-    (void) configure_peripheral();
-  }
-
-  bool write(std::uint8_t p_address, std::span<std::uint8_t const> p_data)
-  {
-    if (!wait_idle()) {
-      return false;
-    }
-
-    DL_I2C_fillControllerTXFIFO(
-      I2C1, p_data.data(), static_cast<std::uint16_t>(p_data.size()));
-    DL_I2C_startControllerTransfer(I2C1,
-                                   p_address,
-                                   DL_I2C_CONTROLLER_DIRECTION_TX,
-                                   static_cast<std::uint16_t>(p_data.size()));
-    // errata I2C_ERR_13: let the transfer start before polling status
-    delay_cycles(30);
-    return wait_done();
-  }
-
-  bool read(std::uint8_t p_address, std::span<std::uint8_t> p_data)
-  {
-    if (!wait_idle()) {
-      return false;
-    }
-
-    DL_I2C_startControllerTransfer(I2C1,
-                                   p_address,
-                                   DL_I2C_CONTROLLER_DIRECTION_RX,
-                                   static_cast<std::uint16_t>(p_data.size()));
-    delay_cycles(30);
-
-    for (auto& byte : p_data) {
-      // Each byte gets its own budget, so the deadline also guards against
-      // the sensor going quiet part-way through a burst.
-      auto const byte_deadline = deadline();
-      while (DL_I2C_isControllerRXFIFOEmpty(I2C1)) {
-        if (DL_I2C_getControllerStatus(I2C1) &
-            DL_I2C_CONTROLLER_STATUS_ERROR) {
-          return false;
-        }
-        if (expired(byte_deadline)) {
-          return false;
-        }
-      }
-      byte = DL_I2C_receiveControllerData(I2C1);
-    }
-
-    return wait_done();
-  }
-
-  /// Waits for the controller to go idle before starting a new transfer.
-  bool wait_idle()
-  {
-    auto const idle_deadline = deadline();
-    while (!(DL_I2C_getControllerStatus(I2C1) &
-             DL_I2C_CONTROLLER_STATUS_IDLE)) {
-      if (expired(idle_deadline)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /// Waits for the transfer in flight to finish, then reports bus errors.
-  bool wait_done()
-  {
-    auto const done_deadline = deadline();
-    while (DL_I2C_getControllerStatus(I2C1) &
-           DL_I2C_CONTROLLER_STATUS_BUSY) {
-      if (expired(done_deadline)) {
-        return false;
-      }
-    }
-    return !(DL_I2C_getControllerStatus(I2C1) &
-             DL_I2C_CONTROLLER_STATUS_ERROR);
-  }
-
-  /// Absolute clock reading at which the current wait gives up. The steady
-  /// clock is 64-bit and monotonic, so this needs no wrap handling.
-  [[nodiscard]] std::uint64_t deadline()
-  {
-    return m_clock->uptime() + m_timeout_ticks;
-  }
-
-  [[nodiscard]] bool expired(std::uint64_t p_deadline)
-  {
-    return m_clock->uptime() >= p_deadline;
-  }
-
-  lab2::steady_clock* m_clock;
-  std::uint64_t m_timeout_ticks;
   settings m_settings{};
-  std::uint32_t m_fault_count = 0;
-  bool m_healthy = true;
+  std::uint32_t m_failures = 0;
 };
 
 }  // namespace mspm0

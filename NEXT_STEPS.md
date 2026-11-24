@@ -168,7 +168,9 @@ With the battery **disconnected**, check with a multimeter:
 
 1. Open `C:\dev\Gimbal-Project` as the CCS workspace.
 2. Build the **`gimbal`** project (it builds `freertos_kernel` automatically).
-   Expect one warning about `.sysmem` — that one is harmless.
+   It should build with no compiler warnings (CCS may note that it substituted
+   SDK 2.11.0.07 / SysConfig 1.28.0 for the older versions the project names -
+   that is harmless).
 3. Flash and run.
 4. Open the **XDS110 virtual COM port at 115200 8N1**.
 
@@ -178,8 +180,12 @@ Expected on boot:
 === CMPE 146 gimbal ===
 BMI160 ready (accelerometer + gyroscope)
 starting scheduler
-angle=-0.42 offset=0.00 servo=0.42
+angle=-0.42 offset=0.00 servo=0.42 bias=-0.37
 ```
+
+**Keep the gimbal still for the first 2 seconds after power-up** - that is the
+gyroscope bias calibration, and telemetry starts once it finishes. If `bias`
+reads exactly `0.00`, it moved during calibration; power-cycle and hold still.
 
 ### LED meaning
 
@@ -217,8 +223,9 @@ Watch the `angle=` field while you tilt the base by hand.
 - Tilt back → returns to `0`
 - Hold still → should be steady, not drifting or jittering
 
-*If angle drifts while held still:* the gyro bias is larger than typical. Tell me
-and I'll add a startup bias calibration (average a few hundred samples at rest).
+*If angle drifts while held still:* check `bias` - if it is `0.00`, calibration
+was skipped because the board moved; power-cycle and keep it still for 2 s. If
+`bias` is non-zero and it still drifts, the IMU is probably loose on its mount.
 
 *If it reads the negative of the tilt:* don't edit the filter — that's what
 `invert_servo` is for in Test 5.
@@ -277,11 +284,19 @@ forever when no debugger is attached.
 Run it for a full 3 minutes while tilting the base around. The heartbeat must
 not stop and it must not need a reset.
 
-> **Known risk I'd like to fix before the demo:** the I2C wait loops have no
-> timeout. If a jumper to the IMU comes loose mid-demo, the sensor task blocks
-> forever — the heartbeat keeps blinking so it *looks* alive while stabilization
-> is frozen. Say the word and I'll add a bounded timeout. Until then, make sure
-> the IMU wires are solidly seated, ideally soldered or taped down.
+**Fault-recovery test (worth showing the TA):** while it runs, pull the IMU's
+SDA jumper for a couple of seconds, then push it back in. Expected:
+- While unplugged: the platform freezes at its last angle (no runaway drift),
+  and the heartbeat keeps blinking.
+- After reconnecting: within about half a second it stabilizes again, with no
+  reset.
+
+How that works: every I2C wait is bounded (~5 ms), so a missing sensor makes a
+read fail instead of hanging. After a failure the driver bit-bangs nine SCL
+pulses plus a STOP to free a stuck bus and resets the I2C peripheral. After
+20 failed reads in a row (~100 ms) the BMI160 driver re-runs its start-up
+sequence. A failed gyro read reports zero rotation, so the angle cannot drift
+during an outage.
 
 ---
 
@@ -292,6 +307,7 @@ Everything lives in `gimbal::tuning`, set from `gimbal/main.cpp`:
 | Field | Default | Change it when |
 |---|---|---|
 | `stabilized_axis` | `roll` | Wrong axis responds to your tilt |
+| `gyro_calibration_max_spread_dps` | `3.0` | `bias` keeps reading 0.00 even when held still → raise to 5.0 |
 | `filter_weight` | `0.98` | Lower (0.95) if it oscillates; raise (0.99) if noisy |
 | `joystick_range_degrees` | `30` | Want more/less joystick authority; negate to reverse |
 | `joystick_deadzone` | `0.08` | Stick creeps at centre → raise it |
@@ -305,13 +321,17 @@ Everything lives in `gimbal::tuning`, set from `gimbal/main.cpp`:
 Probe `PB2` (SCL, pin 9) and `PB3` (SDA, pin 10), ground to pin 20. Bus runs at
 **100 kHz**.
 
-Every 10 ms the sensor task makes two write-then-read transactions:
-1. Write `0x12` (`ACC_X_L`), repeated start, read 6 bytes — accelerometer
-2. Write `0x0C` (`GYR_X_L`), repeated start, read 6 bytes — gyroscope
+Every 10 ms the sensor task reads both sensors. Each read is two separate
+I2C transfers, each with its own START and STOP:
+1. `START, 0x68+W, 0x12 (ACC_X_L), STOP` then `START, 0x68+R, 6 bytes, STOP` - accelerometer
+2. `START, 0x68+W, 0x0C (GYR_X_L), STOP` then `START, 0x68+R, 6 bytes, STOP` - gyroscope
 
-For the slide, label: the 7-bit address `0x68`, the R/W bit, the register
-pointer byte, the repeated start, the ACK after each byte, and the **10 ms gap
-between bursts that proves the 100 Hz rate**.
+There is a STOP between the register byte and the read - that is how this
+driver works, not a fault. The BMI160 keeps its register pointer across it.
+
+For the slide, label: the 7-bit address `0x68` and the R/W bit, the register
+pointer byte, the ACK after each byte, the NACK on the last data byte, and the
+**10 ms gap between bursts that proves the 100 Hz rate**.
 
 ---
 

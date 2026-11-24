@@ -46,22 +46,6 @@ namespace {
 /// Standard hobby-servo frame rate.
 constexpr std::uint32_t servo_frequency_hz = 50;
 
-// Servo pulse calibration.
-//
-// The nominal hobby-servo range is 1000-2000 us, but SG90-class servos vary
-// widely: many sweep only about 90 degrees across it rather than the 180 the
-// nominal mapping assumes. That makes the platform under-correct - it leans
-// the right way but never reaches level.
-//
-// Widening the range symmetrically about the 1500 us centre gives more
-// physical travel per commanded degree without shifting the neutral point.
-// 600-2400 us is roughly 1.8x the travel of 1000-2000 us.
-//
-// If the servo buzzes, hums, or warms up at the extremes, it is stalling
-// against its internal end stop - narrow these back toward 1000/2000.
-constexpr std::uint32_t servo_min_pulse_us = 600;
-constexpr std::uint32_t servo_max_pulse_us = 2400;
-
 /// On-board LED2 green: PB27, IOMUX slot 58, active HIGH.
 constexpr unsigned heartbeat_pin = 27;
 constexpr unsigned heartbeat_slot = 58;
@@ -96,20 +80,9 @@ constexpr std::uint32_t telemetry_period_ms = 200;
 StaticTask_t s_telemetry_task_control;
 StackType_t s_telemetry_task_stack[telemetry_stack_words];
 
-/// Everything the telemetry task reads. Diagnostic only - it reads the status
-/// mailbox and the bus fault counter, and writes nothing the control tasks
-/// depend on.
-struct telemetry_context
-{
-  mspm0::telemetry_uart* uart;
-  mspm0::i2c* sensor_bus;
-};
-
 void telemetry_task(void* p_parameters)
 {
-  auto const& context = *static_cast<telemetry_context const*>(p_parameters);
-  auto& uart = *context.uart;
-  auto const& sensor_bus = *context.sensor_bus;
+  auto& uart = *static_cast<mspm0::telemetry_uart*>(p_parameters);
 
   while (true) {
     gimbal::status snapshot{};
@@ -122,16 +95,8 @@ void telemetry_task(void* p_parameters)
       mspm0::append_float(line, sizeof(line), at, snapshot.offset_degrees);
       mspm0::append_text(line, sizeof(line), at, " servo=");
       mspm0::append_float(line, sizeof(line), at, snapshot.servo_degrees);
-
-      // Printed only once something has gone wrong, so a healthy run stays
-      // easy to read. A climbing count means the IMU wiring is intermittent
-      // and the angle estimate is coasting on its last good sample.
-      auto const faults = sensor_bus.fault_count();
-      if (faults != 0) {
-        mspm0::append_text(line, sizeof(line), at, " i2c_faults=");
-        mspm0::append_unsigned(line, sizeof(line), at, faults);
-      }
-
+      mspm0::append_text(line, sizeof(line), at, " bias=");
+      mspm0::append_float(line, sizeof(line), at, snapshot.gyro_bias_dps);
       mspm0::append_text(line, sizeof(line), at, "\r\n");
       uart.write(line);
     }
@@ -159,7 +124,7 @@ int main()
   telemetry.write("\r\n=== CMPE 146 gimbal ===\r\n");
 
   static mspm0::steady_clock clock;
-  static mspm0::i2c sensor_bus(clock);
+  static mspm0::i2c sensor_bus;
   static mspm0::pwm servo_pwm(mspm0::pwm::pb15_timer_g8_channel_0,
                               servo_frequency_hz);
   static mspm0::adc joystick;
@@ -167,13 +132,17 @@ int main()
     mspm0::gpiob, heartbeat_pin, heartbeat_slot);
 
   static sensor::bmi160 imu(sensor_bus, clock);
+  // SG90/MG90S class: about 500-2500 us spans -90..+90 degrees. The generic
+  // 1000-2000 us range only gives about +-45 degrees of real travel, which
+  // made the platform under-correct by roughly half. Narrow these by ~50 us
+  // per side if the servo buzzes or strains at a hard tilt.
   static actuator::servo tilt_servo(servo_pwm,
-                                    { .min_angle = -90.0F,
+                                    actuator::servo::settings{
+                                      .min_angle = -90.0F,
                                       .max_angle = 90.0F,
-                                      .min_pulse_microseconds =
-                                        servo_min_pulse_us,
-                                      .max_pulse_microseconds =
-                                        servo_max_pulse_us });
+                                      .min_pulse_microseconds = 500,
+                                      .max_pulse_microseconds = 2500,
+                                    });
 
   // Every driver above configured its hardware in its own constructor, so by
   // this point the only thing left to check is whether the external sensor
@@ -200,12 +169,10 @@ int main()
     halt_blinking(heartbeat_led, clock);
   }
 
-  static telemetry_context telemetry_parameters{ &telemetry, &sensor_bus };
-
   if (xTaskCreateStatic(telemetry_task,
                         "telemetry_task",
                         telemetry_stack_words,
-                        &telemetry_parameters,
+                        &telemetry,
                         tskIDLE_PRIORITY + 1,
                         s_telemetry_task_stack,
                         &s_telemetry_task_control) == nullptr) {

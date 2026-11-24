@@ -201,43 +201,6 @@ inline void append_float(char* p_buffer,
   p_buffer[(p_at < p_capacity) ? p_at : p_capacity - 1] = '\0';
 }
 
-/**
- * @brief Append an unsigned integer to a character buffer.
- *
- * Same hand-rolled approach as append_float and for the same reason: the
- * library formatting path on this toolchain is large, and std::printf would
- * route through debugger semihosting, which blocks with no debugger attached.
- *
- * @param p_buffer - destination buffer
- * @param p_capacity - total size of p_buffer
- * @param p_at - current write offset, advanced past the characters written
- * @param p_value - value to format
- */
-inline void append_unsigned(char* p_buffer,
-                            std::size_t p_capacity,
-                            std::size_t& p_at,
-                            std::uint32_t p_value)
-{
-  // Digits come out least-significant first, so collect then emit reversed.
-  char digits[12];
-  std::size_t digit_count = 0;
-  auto remaining = p_value;
-  do {
-    digits[digit_count++] = static_cast<char>('0' + (remaining % 10));
-    remaining /= 10;
-  } while (remaining != 0 && digit_count < sizeof(digits));
-
-  while (digit_count > 0) {
-    if (p_at + 1 < p_capacity) {
-      p_buffer[p_at++] = digits[--digit_count];
-    } else {
-      digit_count--;
-    }
-  }
-
-  p_buffer[(p_at < p_capacity) ? p_at : p_capacity - 1] = '\0';
-}
-
 /// Append a null-terminated string, advancing the write offset.
 inline void append_text(char* p_buffer,
                         std::size_t p_capacity,
