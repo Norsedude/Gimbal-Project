@@ -120,6 +120,12 @@ public:
     return m_initialized;
   }
 
+  /// Times the sensor stopped answering and was re-initialised after start-up.
+  [[nodiscard]] std::uint32_t recovery_count() const
+  {
+    return m_recoveries;
+  }
+
   /// Acceleration in standard gravities, as a lab4::accelerometer.
   [[nodiscard]] lab4::accelerometer& acceleration()
   {
@@ -308,13 +314,44 @@ private:
            angular_velocity_mode == power_mode_normal;
   }
 
-  // On a bus error the last good sample is returned rather than zeros, so a
-  // single dropped transaction cannot kick the complementary filter with a
-  // bogus 0 g / 0 dps reading.
+  /// Consecutive failed reads that trigger a full sensor re-initialisation.
+  /// The application reads twice per 10 ms cycle, so 20 is about 100 ms of
+  /// silence - long enough to ignore a one-off glitch, short enough that a
+  /// re-seated wire is picked up again almost immediately.
+  static constexpr std::uint32_t failures_before_recovery = 20;
+
+  /**
+   * @brief Track read health and re-initialise the sensor if it went away.
+   *
+   * A loose jumper or a supply dip can reset the BMI160 back into suspend
+   * mode, after which it answers with stale or zero data forever. Re-running
+   * the start-up sequence brings it back without a board reset. One attempt
+   * per trigger (not the five used at power-on) bounds the time spent here
+   * to roughly the 210 ms of datasheet start-up delays.
+   */
+  void note_read(bool p_succeeded)
+  {
+    if (p_succeeded) {
+      m_consecutive_failures = 0;
+      return;
+    }
+    if (++m_consecutive_failures < failures_before_recovery) {
+      return;
+    }
+    m_consecutive_failures = 0;
+    m_recoveries++;
+    m_initialized = attempt_configure();
+  }
+
+  // On a bus error the last good acceleration sample is returned rather than
+  // zeros: 0 g on every axis would read as a wild tilt and kick the
+  // complementary filter.
   lab4::accelerometer::read_t read_acceleration()
   {
     std::array<std::uint8_t, axis_data_bytes> raw{};
-    if (!read_registers(register_acceleration_data, raw)) {
+    bool const succeeded = read_registers(register_acceleration_data, raw);
+    note_read(succeeded);
+    if (!succeeded) {
       return m_last_acceleration;
     }
 
@@ -326,11 +363,17 @@ private:
     return m_last_acceleration;
   }
 
+  // On a bus error the gyroscope reports zero rotation, not the last good
+  // rate. The filter integrates this value, so repeating a non-zero rate for
+  // the length of an outage would walk the angle away without bound; zero
+  // lets the estimate settle on the last good accelerometer angle instead.
   lab4::gyroscope::read_t read_angular_velocity()
   {
     std::array<std::uint8_t, axis_data_bytes> raw{};
-    if (!read_registers(register_angular_velocity_data, raw)) {
-      return m_last_angular_velocity;
+    bool const succeeded = read_registers(register_angular_velocity_data, raw);
+    note_read(succeeded);
+    if (!succeeded) {
+      return { 0.0F, 0.0F, 0.0F };
     }
 
     m_last_angular_velocity = {
@@ -383,6 +426,8 @@ private:
   float m_acceleration_scale;
   float m_angular_velocity_scale;
   bool m_initialized = false;
+  std::uint32_t m_consecutive_failures = 0;
+  std::uint32_t m_recoveries = 0;
   lab4::accelerometer::read_t m_last_acceleration{ 0.0F, 0.0F, 1.0F };
   lab4::gyroscope::read_t m_last_angular_velocity{ 0.0F, 0.0F, 0.0F };
   acceleration_channel m_acceleration_channel{ *this };

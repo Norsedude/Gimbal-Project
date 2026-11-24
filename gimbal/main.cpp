@@ -95,6 +95,8 @@ void telemetry_task(void* p_parameters)
       mspm0::append_float(line, sizeof(line), at, snapshot.offset_degrees);
       mspm0::append_text(line, sizeof(line), at, " servo=");
       mspm0::append_float(line, sizeof(line), at, snapshot.servo_degrees);
+      mspm0::append_text(line, sizeof(line), at, " bias=");
+      mspm0::append_float(line, sizeof(line), at, snapshot.gyro_bias_dps);
       mspm0::append_text(line, sizeof(line), at, "\r\n");
       uart.write(line);
     }

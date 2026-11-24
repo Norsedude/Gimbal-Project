@@ -25,6 +25,8 @@
 // rather than draining a backlog of stale ones. No application state is
 // shared through mutable globals.
 
+#include <cstdint>
+
 #include "../drivers/servo.hpp"
 #include "../hal/accelerometer.hpp"
 #include "../hal/adc.hpp"
@@ -51,6 +53,14 @@ struct tuning
   /// Axis to stabilize.
   axis stabilized_axis = axis::roll;
 
+  /// Gyroscope readings averaged at start-up to measure its zero-rate offset
+  /// (bias). 200 samples at the 100 Hz sensor rate is 2 seconds, during which
+  /// the gimbal must sit still. 0 disables calibration.
+  std::uint32_t gyro_calibration_samples = 200;
+  /// Largest spread (max - min, in degrees per second) allowed across the
+  /// calibration window. A wider spread means the gimbal was moving, so that
+  /// window is discarded and measured again.
+  float gyro_calibration_max_spread_dps = 3.0F;
   /// Complementary filter weight given to the gyroscope-integrated angle.
   /// The accelerometer gets the remaining (1 - weight).
   float filter_weight = 0.98F;
@@ -102,6 +112,10 @@ struct status
   float offset_degrees;
   /// Angle commanded to the servo, after trim and clamping, in degrees.
   float servo_degrees;
+  /// Gyroscope bias measured at start-up and subtracted from every reading,
+  /// in degrees per second. Exactly 0 means calibration was skipped or the
+  /// gimbal never held still long enough to measure it.
+  float gyro_bias_dps;
 };
 
 /**

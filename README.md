@@ -196,11 +196,17 @@ angle = 0.98 * (angle + gyro_rate * dt) + 0.02 * accel_angle
   acceleration that is not gravity.
 - The weighted blend takes the best of each.
 
-Two details beyond the formula:
+Three details beyond the formula:
 
-1. **`dt` is measured, not assumed.** `sensor_task` reads `steady_clock` each
+1. **Gyroscope bias is calibrated at start-up.** For the first 2 seconds
+   `sensor_task` averages 200 gyro readings while the gimbal sits still and
+   subtracts that offset from every later reading. A window is only accepted
+   if the readings stay within 3 deg/s of each other; if the gimbal was moving
+   it is retried, up to 5 times, then skipped rather than trusting a bias
+   measured during motion.
+2. **`dt` is measured, not assumed.** `sensor_task` reads `steady_clock` each
    cycle, so if a cycle runs late the gyro integration is still correct.
-2. **The filter is seeded from the accelerometer** at startup, so the estimate
+3. **The filter is seeded from the accelerometer** at startup, so the estimate
    begins at the true angle instead of ramping to it from zero.
 
 Roll uses `atan2(ay, az)` and gyro X. Pitch uses `atan2(-ax, hypot(ay, az))`
@@ -217,8 +223,15 @@ project dependency on `freertos_kernel`, so building `gimbal` builds both.
 
 In CCS: open this folder as the workspace, then build the `gimbal` project.
 
-Current footprint: **FLASH 19 %** (24.8 KB of 128 KB), **SRAM 49 %**
-(16.2 KB of 32 KB).
+Current footprint: **FLASH 19 %** (24.7 KB of 128 KB), **SRAM 46 %**
+(14.6 KB of 32 KB).
+
+The project compiles with `-fno-threadsafe-statics`. The C++ guard that would
+otherwise protect each function-local `static` in `main()` has an error path
+that prints through `vfprintf`, which drags the whole semihosting host-I/O
+library into the image. Nothing runs concurrently before the scheduler starts,
+so the guard protects nothing; dropping it removes `printf`, file I/O, and
+`malloc` from the build entirely.
 
 ### Telemetry
 
@@ -228,11 +241,15 @@ Open the XDS110 virtual COM port at **115200 8N1**. On boot:
 === CMPE 146 gimbal ===
 BMI160 ready (accelerometer + gyroscope)
 starting scheduler
-angle=-1.24 offset=0.00 servo=1.24
+angle=-1.24 offset=0.00 servo=1.24 bias=-0.37
 ```
 
-`angle` is the filtered base tilt, `offset` the joystick contribution, `servo`
-the commanded angle after trim and clamping.
+Nothing prints for the first ~2 seconds after `starting scheduler`: that is the
+gyroscope calibration (keep the gimbal still). `angle` is the filtered base
+tilt, `offset` the joystick contribution, `servo` the commanded angle after
+trim and clamping, and `bias` the gyroscope offset measured at start-up and
+subtracted from every reading (exactly `0.00` means the gimbal moved during
+calibration and it was skipped - power-cycle and hold it still).
 
 > No `std::printf` anywhere in this project. On this toolchain it reaches the
 > host through debugger semihosting, which **blocks forever when no debugger is
@@ -286,6 +303,8 @@ Do these in order; each step isolates one thing.
 | Field | Default | Purpose |
 |---|---|---|
 | `stabilized_axis` | `roll` | Which axis is held level |
+| `gyro_calibration_samples` | `200` | Start-up gyro bias average (2 s); 0 disables |
+| `gyro_calibration_max_spread_dps` | `3.0` | Max motion allowed during calibration |
 | `filter_weight` | `0.98` | Gyro share of the complementary filter |
 | `sensor_rate_hz` | `100` | Control loop rate |
 | `input_rate_hz` | `50` | Joystick sample rate |
@@ -306,10 +325,24 @@ Probe **PB2 (SCL, BP pin 9)** and **PB3 (SDA, BP pin 10)**, ground to BP pin
 1. **Accelerometer read** — write `0x12` (`ACC_X_L`), then read 6 bytes
 2. **Gyroscope read** — write `0x0C` (`GYR_X_L`), then read 6 bytes
 
-Each is a write-then-read: start, address `0x68` + W, register byte, repeated
-start, address `0x68` + R, six data bytes, stop. For the slide, point out the
-7-bit address `0x68`, the R/W bit, the register pointer, the ACK after each
-byte, and the 10 ms gap that confirms the 100 Hz sensor rate.
+Each read is **two separate I2C transfers**, each with its own START and STOP:
+
+```
+START | 0x68 + W | ACK | register | ACK | STOP
+START | 0x68 + R | ACK | d0 ACK d1 ACK ... d5 NACK | STOP
+```
+
+The first transfer sets the BMI160's register pointer; the second reads six
+bytes starting there (X low, X high, Y low, Y high, Z low, Z high). The sensor
+keeps the pointer across the STOP, so this reads the same data a repeated-start
+transfer would. On the capture you will see a **STOP between the register byte
+and the read** - that is expected, not a fault.
+
+For the slide, point out: the 7-bit address `0x68` and the R/W bit after it
+(`0xD0` write, `0xD1` read on the wire), the register pointer byte, the ACK
+after every byte, the controller's NACK on the last data byte (telling the
+sensor to stop sending), and the **10 ms gap between bursts** that confirms
+the 100 Hz sensor rate.
 
 ---
 

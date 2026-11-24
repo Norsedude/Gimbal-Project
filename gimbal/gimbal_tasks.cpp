@@ -22,6 +22,8 @@ struct tilt_measurement
 {
   /// Filtered tilt of the base on the stabilized axis, in degrees.
   float angle_degrees;
+  /// Gyroscope bias the filter is correcting for, in degrees per second.
+  float gyro_bias_dps;
 };
 
 /// input_task -> actuator_task
@@ -120,6 +122,59 @@ float angular_rate(lab4::gyroscope::read_t const& p_angular_velocity,
   return (p_axis == axis::roll) ? p_angular_velocity.x : p_angular_velocity.y;
 }
 
+/// Calibration windows tried before giving up and running uncalibrated.
+constexpr int gyro_calibration_attempts = 5;
+
+/**
+ * @brief Measure the gyroscope zero-rate offset on the stabilized axis.
+ *
+ * A MEMS gyroscope at rest does not read exactly 0 - the BMI160 datasheet
+ * allows a few degrees per second of offset. The complementary filter
+ * integrates the rate, so an uncorrected offset becomes a steady angle error
+ * that the 2 % accelerometer share has to keep fighting. Averaging the rate
+ * while the gimbal is still and subtracting it removes that error at source.
+ *
+ * Each window is only accepted if every sample stays within a narrow spread;
+ * if the gimbal is being handled the window is thrown away and retried, and
+ * after several failed windows the filter runs uncalibrated rather than
+ * trusting a bias measured during motion.
+ *
+ * @return the offset in degrees per second, or 0 if it could not be measured
+ */
+float measure_gyro_bias(task_context& p_context, TickType_t p_period_ticks)
+{
+  auto const& parameters = p_context.parameters;
+  auto const samples = parameters.gyro_calibration_samples;
+  if (samples == 0) {
+    return 0.0F;
+  }
+
+  for (int attempt = 0; attempt < gyro_calibration_attempts; attempt++) {
+    float total = 0.0F;
+    float lowest = 0.0F;
+    float highest = 0.0F;
+    auto wake_time = xTaskGetTickCount();
+
+    for (std::uint32_t index = 0; index < samples; index++) {
+      xTaskDelayUntil(&wake_time, p_period_ticks);
+      auto const rate = angular_rate(p_context.gyroscope->read(),
+                                     parameters.stabilized_axis);
+      if (index == 0 || rate < lowest) {
+        lowest = rate;
+      }
+      if (index == 0 || rate > highest) {
+        highest = rate;
+      }
+      total += rate;
+    }
+
+    if ((highest - lowest) <= parameters.gyro_calibration_max_spread_dps) {
+      return total / static_cast<float>(samples);
+    }
+  }
+  return 0.0F;
+}
+
 // ===========================================================================
 // sensor_task - BMI160 accelerometer + gyroscope, complementary filter
 // ===========================================================================
@@ -134,6 +189,11 @@ void sensor_task(void* p_parameters)
                                                : 100.0F);
   auto const period_ticks = pdMS_TO_TICKS(
     static_cast<std::uint32_t>((nominal_period * 1000.0F) + 0.5F));
+
+  // Measure the gyroscope offset first, while the gimbal is still at
+  // power-up. The actuator task holds the servo at centre until the first
+  // angle is published below.
+  auto const gyro_bias = measure_gyro_bias(context, period_ticks);
 
   // Seed the filter from the accelerometer so the estimate starts at the real
   // angle instead of walking up to it from zero over the first few seconds.
@@ -163,7 +223,7 @@ void sensor_task(void* p_parameters)
     auto const measured_angle =
       acceleration_angle(acceleration, parameters.stabilized_axis);
     auto const measured_rate =
-      angular_rate(angular_velocity, parameters.stabilized_axis);
+      angular_rate(angular_velocity, parameters.stabilized_axis) - gyro_bias;
 
     // Complementary filter: trust the gyroscope over short intervals, and let
     // the accelerometer slowly correct its drift.
@@ -171,7 +231,7 @@ void sensor_task(void* p_parameters)
     angle = (weight * (angle + (measured_rate * elapsed_seconds))) +
             ((1.0F - weight) * measured_angle);
 
-    tilt_measurement const message{ angle };
+    tilt_measurement const message{ angle, gyro_bias };
     (void) xQueueOverwrite(s_angle_mailbox, &message);
   }
 }
@@ -236,7 +296,7 @@ void actuator_task(void* p_parameters)
   auto& context = *static_cast<task_context*>(p_parameters);
   auto const& parameters = context.parameters;
 
-  tilt_measurement tilt{ 0.0F };
+  tilt_measurement tilt{ 0.0F, 0.0F };
   target_adjustment adjustment{ 0.0F };
 
   while (true) {
@@ -263,6 +323,7 @@ void actuator_task(void* p_parameters)
       tilt.angle_degrees,
       adjustment.offset_degrees,
       context.servo->angle(),
+      tilt.gyro_bias_dps,
     };
     (void) xQueueOverwrite(s_status_mailbox, &snapshot);
   }
