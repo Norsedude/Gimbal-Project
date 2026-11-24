@@ -96,9 +96,20 @@ constexpr std::uint32_t telemetry_period_ms = 200;
 StaticTask_t s_telemetry_task_control;
 StackType_t s_telemetry_task_stack[telemetry_stack_words];
 
+/// Everything the telemetry task reads. Diagnostic only - it reads the status
+/// mailbox and the bus fault counter, and writes nothing the control tasks
+/// depend on.
+struct telemetry_context
+{
+  mspm0::telemetry_uart* uart;
+  mspm0::i2c* sensor_bus;
+};
+
 void telemetry_task(void* p_parameters)
 {
-  auto& uart = *static_cast<mspm0::telemetry_uart*>(p_parameters);
+  auto const& context = *static_cast<telemetry_context const*>(p_parameters);
+  auto& uart = *context.uart;
+  auto const& sensor_bus = *context.sensor_bus;
 
   while (true) {
     gimbal::status snapshot{};
@@ -111,6 +122,16 @@ void telemetry_task(void* p_parameters)
       mspm0::append_float(line, sizeof(line), at, snapshot.offset_degrees);
       mspm0::append_text(line, sizeof(line), at, " servo=");
       mspm0::append_float(line, sizeof(line), at, snapshot.servo_degrees);
+
+      // Printed only once something has gone wrong, so a healthy run stays
+      // easy to read. A climbing count means the IMU wiring is intermittent
+      // and the angle estimate is coasting on its last good sample.
+      auto const faults = sensor_bus.fault_count();
+      if (faults != 0) {
+        mspm0::append_text(line, sizeof(line), at, " i2c_faults=");
+        mspm0::append_unsigned(line, sizeof(line), at, faults);
+      }
+
       mspm0::append_text(line, sizeof(line), at, "\r\n");
       uart.write(line);
     }
@@ -138,7 +159,7 @@ int main()
   telemetry.write("\r\n=== CMPE 146 gimbal ===\r\n");
 
   static mspm0::steady_clock clock;
-  static mspm0::i2c sensor_bus;
+  static mspm0::i2c sensor_bus(clock);
   static mspm0::pwm servo_pwm(mspm0::pwm::pb15_timer_g8_channel_0,
                               servo_frequency_hz);
   static mspm0::adc joystick;
@@ -179,10 +200,12 @@ int main()
     halt_blinking(heartbeat_led, clock);
   }
 
+  static telemetry_context telemetry_parameters{ &telemetry, &sensor_bus };
+
   if (xTaskCreateStatic(telemetry_task,
                         "telemetry_task",
                         telemetry_stack_words,
-                        &telemetry,
+                        &telemetry_parameters,
                         tskIDLE_PRIORITY + 1,
                         s_telemetry_task_stack,
                         &s_telemetry_task_control) == nullptr) {
