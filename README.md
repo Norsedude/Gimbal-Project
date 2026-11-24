@@ -209,6 +209,41 @@ rotation about the gravity vector, so a yaw estimate would drift without bound.
 
 ---
 
+## Servo calibration (measured, not assumed)
+
+The nominal hobby-servo mapping is 1000–2000 µs across 180° of travel. **The
+servo on this build does not follow it**, and assuming it did made the platform
+under-correct — it leaned the right way but never reached level.
+
+Measured on hardware: rotating the IMU **90°** moved the arm only **45°**, a
+clean 2× shortfall. So this servo sweeps roughly **90° per 1000 µs**, half the
+nominal rate.
+
+The fix is in `gimbal/main.cpp`: widen the pulse range symmetrically about the
+1500 µs neutral point, which increases microseconds-per-commanded-degree
+without shifting the zero position.
+
+```
+             span      µs/degree    travel at full command
+1000-2000 us  1000 us    5.56         ~45 deg   (under-corrects 2x)
+ 600-2400 us  1800 us   10.00         ~81 deg   (correct in practice)
+```
+
+Centring on 1500 µs matters: an asymmetric range (say 500–2400) would move
+neutral to 1450 µs and tilt the platform at rest.
+
+> Widening the pulse range is only safe while the servo can physically reach
+> the commanded positions. A servo being driven past its internal end stop
+> **buzzes or hums and warms up**, draws 700 mA+ continuously, and can strip
+> its gears. A healthy servo at the end of its travel is silent. If it buzzes,
+> narrow the range back toward 1000/2000.
+
+The alternative fix — keeping 1000–2000 µs and setting the angle limits to ±45
+— gives exact 1:1 correction with no stall risk at all, at the cost of halving
+the maximum correctable tilt.
+
+---
+
 ## Build and run
 
 The workspace holds two CCS projects: `freertos_kernel` (the RTOS, sources

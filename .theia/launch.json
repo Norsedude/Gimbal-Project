@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "gimbal",
+            "type": "ccs-debug",
+            "request": "launch",
+            "projectInfo": {
+                "name": "gimbal",
+                "resourceId": "/gimbal"
+            }
+        },
+        {
+            "name": "lab4_i2c",
+            "type": "ccs-debug",
+            "request": "launch",
+            "projectInfo": {
+                "name": "lab4_i2c",
+                "resourceId": "/lab4_i2c"
+            }
+        }
+    ]
+}

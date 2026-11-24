@@ -46,6 +46,22 @@ namespace {
 /// Standard hobby-servo frame rate.
 constexpr std::uint32_t servo_frequency_hz = 50;
 
+// Servo pulse calibration.
+//
+// The nominal hobby-servo range is 1000-2000 us, but SG90-class servos vary
+// widely: many sweep only about 90 degrees across it rather than the 180 the
+// nominal mapping assumes. That makes the platform under-correct - it leans
+// the right way but never reaches level.
+//
+// Widening the range symmetrically about the 1500 us centre gives more
+// physical travel per commanded degree without shifting the neutral point.
+// 600-2400 us is roughly 1.8x the travel of 1000-2000 us.
+//
+// If the servo buzzes, hums, or warms up at the extremes, it is stalling
+// against its internal end stop - narrow these back toward 1000/2000.
+constexpr std::uint32_t servo_min_pulse_us = 600;
+constexpr std::uint32_t servo_max_pulse_us = 2400;
+
 /// On-board LED2 green: PB27, IOMUX slot 58, active HIGH.
 constexpr unsigned heartbeat_pin = 27;
 constexpr unsigned heartbeat_slot = 58;
@@ -130,7 +146,13 @@ int main()
     mspm0::gpiob, heartbeat_pin, heartbeat_slot);
 
   static sensor::bmi160 imu(sensor_bus, clock);
-  static actuator::servo tilt_servo(servo_pwm);
+  static actuator::servo tilt_servo(servo_pwm,
+                                    { .min_angle = -90.0F,
+                                      .max_angle = 90.0F,
+                                      .min_pulse_microseconds =
+                                        servo_min_pulse_us,
+                                      .max_pulse_microseconds =
+                                        servo_max_pulse_us });
 
   // Every driver above configured its hardware in its own constructor, so by
   // this point the only thing left to check is whether the external sensor
