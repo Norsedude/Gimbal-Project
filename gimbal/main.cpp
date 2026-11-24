@@ -132,7 +132,17 @@ int main()
     mspm0::gpiob, heartbeat_pin, heartbeat_slot);
 
   static sensor::bmi160 imu(sensor_bus, clock);
-  static actuator::servo tilt_servo(servo_pwm);
+  // SG90/MG90S class: about 500-2500 us spans -90..+90 degrees. The generic
+  // 1000-2000 us range only gives about +-45 degrees of real travel, which
+  // made the platform under-correct by roughly half. Narrow these by ~50 us
+  // per side if the servo buzzes or strains at a hard tilt.
+  static actuator::servo tilt_servo(servo_pwm,
+                                    actuator::servo::settings{
+                                      .min_angle = -90.0F,
+                                      .max_angle = 90.0F,
+                                      .min_pulse_microseconds = 500,
+                                      .max_pulse_microseconds = 2500,
+                                    });
 
   // Every driver above configured its hardware in its own constructor, so by
   // this point the only thing left to check is whether the external sensor

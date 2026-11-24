@@ -122,8 +122,9 @@ float angular_rate(lab4::gyroscope::read_t const& p_angular_velocity,
   return (p_axis == axis::roll) ? p_angular_velocity.x : p_angular_velocity.y;
 }
 
-/// Calibration windows tried before giving up and running uncalibrated.
-constexpr int gyro_calibration_attempts = 5;
+/// Calibration windows tried before settling for the steadiest one. Three
+/// windows bound the start-up delay to 6 seconds.
+constexpr int gyro_calibration_attempts = 3;
 
 /**
  * @brief Measure the gyroscope zero-rate offset on the stabilized axis.
@@ -134,10 +135,12 @@ constexpr int gyro_calibration_attempts = 5;
  * that the 2 % accelerometer share has to keep fighting. Averaging the rate
  * while the gimbal is still and subtracting it removes that error at source.
  *
- * Each window is only accepted if every sample stays within a narrow spread;
- * if the gimbal is being handled the window is thrown away and retried, and
- * after several failed windows the filter runs uncalibrated rather than
- * trusting a bias measured during motion.
+ * A window whose samples stay within a narrow spread was taken at rest and is
+ * used straight away. Otherwise a few more windows are tried, and the
+ * steadiest of them is used if it is no worse than hand tremor: tremor
+ * oscillates around the true offset, so its average is still a good
+ * estimate. If every window shows deliberate motion, the filter runs
+ * uncalibrated rather than trusting a bias measured while being tilted.
  *
  * @return the offset in degrees per second, or 0 if it could not be measured
  */
@@ -148,6 +151,9 @@ float measure_gyro_bias(task_context& p_context, TickType_t p_period_ticks)
   if (samples == 0) {
     return 0.0F;
   }
+
+  float steadiest_spread = parameters.gyro_calibration_handheld_spread_dps;
+  float steadiest_bias = 0.0F;
 
   for (int attempt = 0; attempt < gyro_calibration_attempts; attempt++) {
     float total = 0.0F;
@@ -168,11 +174,17 @@ float measure_gyro_bias(task_context& p_context, TickType_t p_period_ticks)
       total += rate;
     }
 
-    if ((highest - lowest) <= parameters.gyro_calibration_max_spread_dps) {
-      return total / static_cast<float>(samples);
+    auto const spread = highest - lowest;
+    auto const average = total / static_cast<float>(samples);
+    if (spread <= parameters.gyro_calibration_max_spread_dps) {
+      return average;  // at rest: as good as it gets
+    }
+    if (spread <= steadiest_spread) {
+      steadiest_spread = spread;
+      steadiest_bias = average;
     }
   }
-  return 0.0F;
+  return steadiest_bias;
 }
 
 // ===========================================================================

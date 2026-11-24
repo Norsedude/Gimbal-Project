@@ -55,12 +55,18 @@ struct tuning
 
   /// Gyroscope readings averaged at start-up to measure its zero-rate offset
   /// (bias). 200 samples at the 100 Hz sensor rate is 2 seconds, during which
-  /// the gimbal must sit still. 0 disables calibration.
+  /// the gimbal should be kept still. 0 disables calibration.
   std::uint32_t gyro_calibration_samples = 200;
-  /// Largest spread (max - min, in degrees per second) allowed across the
-  /// calibration window. A wider spread means the gimbal was moving, so that
-  /// window is discarded and measured again.
+  /// Spread (max - min, in degrees per second) below which a calibration
+  /// window counts as "at rest" and is accepted immediately. A window resting
+  /// on a table is well under this.
   float gyro_calibration_max_spread_dps = 3.0F;
+  /// Spread up to which a window is still usable if no window was at rest.
+  /// Hand tremor shakes the reading back and forth around the true offset,
+  /// so the 2-second average stays accurate even though the spread exceeds
+  /// the at-rest limit. Anything wider means the gimbal was being deliberately
+  /// tilted, and the filter runs uncalibrated instead.
+  float gyro_calibration_handheld_spread_dps = 20.0F;
   /// Complementary filter weight given to the gyroscope-integrated angle.
   /// The accelerometer gets the remaining (1 - weight).
   float filter_weight = 0.98F;
